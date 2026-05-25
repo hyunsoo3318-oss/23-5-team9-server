@@ -1,159 +1,97 @@
-# 23-5-team9-server
-### 와플스튜디오 23.5기 9조 server Workflow
+# Carrot — Real-Time Auction & Marketplace Server
 
-build db
+> _A second-hand marketplace backend with live auctions, virtual-currency payments, and real-time chat — built async, end to end._
 
-- 기본 작업 브랜치: `dev`
-- 각 기능들을 개발할 때: `feature/function` 브랜치를 만들어 해당 브랜치에서 작업
-- 기능이 완성된 경우 `dev` 브랜치로 병합 후 디버깅
-- 디비깅이 완료되면 `main` 브랜치로 병합
+![Python](https://img.shields.io/badge/Python-3.11-3776AB?logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.128-009688?logo=fastapi&logoColor=white)
+![SQLAlchemy](https://img.shields.io/badge/SQLAlchemy-2.0-D71F00?logo=sqlalchemy&logoColor=white)
+![MySQL](https://img.shields.io/badge/MySQL-aiomysql-4479A1?logo=mysql&logoColor=white)
+![WebSocket](https://img.shields.io/badge/WebSocket-Realtime-010101?logo=socketdotio&logoColor=white)
+![Alembic](https://img.shields.io/badge/Alembic-migrations-1F4E79)
+![Docker](https://img.shields.io/badge/Docker-GHCR%20%2B%20EC2-2496ED?logo=docker&logoColor=white)
 
----
+This is the backend server for the **Waffle Studio 23.5 Team 9** project — a Karrot-style ("당근마켓") second-hand trading platform extended with a live auction feature.
 
-# 기능 매핑 및 구현 범위
+## Overview
 
-## 1. 인증 / 회원 관리
+Carrot is a fully asynchronous FastAPI service backing a location-based second-hand marketplace. It exposes a REST API for users, products, regions, virtual-currency payments, and image uploads, layered with a real-time subsystem that powers live auctions and WebSocket chat. The codebase follows a clean per-domain module layout (router → service → repository over SQLAlchemy 2.0 async ORM models), with MySQL as the system of record, JWT-based stateless auth plus Google OAuth2, and an S3-backed image store. Everything runs on async SQLAlchemy (`aiomysql`) and `uvicorn`, and ships as a Docker image deployed to EC2 behind nginx.
 
-### 회원가입
-- 이메일 / 비밀번호 기반 회원가입
-- 비밀번호 해싱 처리
-- 이메일 중복 검사
-- 입력값 유효성 검증
+## Technical Highlights
 
-### 로그인 / 로그아웃
-- 이메일 + 비밀번호 로그인
-- 인증 토큰 발급 (Access / Refresh)
-- 로그아웃 시 토큰 무효화
+- **Auction domain & bidding.** Auctions are modeled as a one-to-one extension of a `Product` (`Auction` carries `current_price`, `end_at`, `bid_count`, and a `status` of `active / finished / failed / canceled`), with each `Bid` linked to its auction and bidder. The `place_bid` flow validates that the auction is still `ACTIVE`, that the deadline has not passed, and that the new bid strictly exceeds the current price, then inserts the bid and bumps `current_price` / `bid_count` **within a single committed transaction** so the highest price and the winning bid stay consistent. Auction listings support category and region filtering with eager-loaded product data, ordered by closing time.
+- **Real-time chat over WebSocket.** A WebSocket endpoint (`/api/chat/ws/{room_id}`) authenticates the client via a JWT sent as the first message, then enters a receive-broadcast loop. Incoming messages are routed to the correct table — 1:1 (`ChatRoom`) or group (`GroupChatRoom`, with membership verification) — persisted as `ChatMessage`, and fanned out to every connected peer in the room through an in-process `ConnectionManager` that tracks sockets by room id. The system supports both direct messaging and open group rooms (admin/kick/leave/join semantics), making it suitable for auction-participant group chat.
+- **Authentication & sessions.** Stateless JWT auth issues short-lived access tokens and long-lived refresh tokens (HS256, distinct secrets per token type). Passwords are hashed with **Argon2**, verified off the event loop via a thread executor. Token rotation is supported on refresh, and revocation is handled by a `blocked_tokens` denylist checked on every refresh/logout. Social login is implemented with **Authlib + Google OAuth2** (OpenID Connect), auto-provisioning users on first login and linking social accounts to existing emails. Starlette `SessionMiddleware` carries the OAuth flow state.
+- **Virtual-currency payments.** A double-entry-style `Ledger` records `DEPOSIT / WITHDRAW / TRANSFER` transactions against per-user `coin` balances. Money movement is **idempotent** (keyed by a client-supplied `request_key`) and **concurrency-safe**: balances are mutated under `SELECT ... FOR UPDATE` row locks inside nested transactions, and transfers acquire the two participant locks in a deterministic id order to avoid deadlocks.
+- **Location-aware regions.** Regions are stored with native MySQL **spatial `GEOMETRY`** columns (SRID 4326). Coordinates are ingested via `ST_GeomFromGeoJSON`, and "nearby" lookup resolves a latitude/longitude pair to its containing administrative region with `ST_Contains(...)`, alongside text search over sido/sigugun/dong hierarchy.
+- **Persistence & migrations.** SQLAlchemy 2.0 declarative models (`Mapped[...]` typing) over an async engine with connection pooling (`pool_pre_ping`, `pool_recycle`). Schema is version-controlled with **Alembic**, which runs migrations synchronously via `pymysql` while the app itself uses `aiomysql`.
+- **Image uploads.** Multipart uploads stream directly to **AWS S3** (`boto3`) under a generated UUID key, with the resulting public URL recorded in an `Image` row and referenced from products and user profiles.
+- **REST surface.** Routers are mounted under `/api`: `auth`, `user`, `product`, `auction`, `chat`, `pay`, `region`, `image`, `category`. Domain errors surface through a unified `CarrotException` handler returning structured `{error_code, error_msg}` responses, with a custom handler for missing-field validation.
+- **Deployment.** A GitHub Actions workflow builds the Docker image, pushes it to **GHCR**, and SSH-deploys to **EC2** — generating the environment file from secrets, running `alembic upgrade head`, and rolling the container behind nginx (with Let's Encrypt/certbot TLS). The `dev` and `prod` branches map to separate images and environments.
 
-### 소셜 로그인
-- OAuth2 기반 소셜 로그인 (예: Google, Kakao)
-- 최초 로그인 시 회원 자동 생성
-- 기존 계정과의 연동 정책 정의
+> **Status note:** The platform is an actively developed team project. The auction REST endpoints for creating and fetching auction detail are present in code but currently commented out (the bidding and listing endpoints are live), and the chat `ConnectionManager` is in-process, so real-time fan-out is scoped to a single server instance.
 
----
+## Architecture
 
-## 2. 게시물 (중고 거래)
+The service is organized by domain under `carrot/app/*`, each module following a **router → service → repository** flow over SQLAlchemy models. `carrot/main.py` builds the FastAPI app, wiring session and CORS middleware and the global exception handlers; `carrot/api.py` aggregates every domain router under the `/api` prefix. Database access is centralized in `carrot/db`, where a `DatabaseManager` owns the pooled async engine and a request-scoped `get_db_session` dependency yields an `AsyncSession` that auto-commits on success and rolls back on error. Authentication is enforced through FastAPI dependencies (`login_with_header` and variants) that decode the bearer JWT and load the current user. The real-time layer lives alongside the chat domain: a WebSocket route persists messages through the same async session factory and broadcasts via a shared in-memory connection registry. Schema evolution is decoupled from runtime through Alembic migrations.
 
-### 게시물 관리
-- 게시물 생성 / 조회 / 수정 / 삭제 (CRUD)
-- 작성자 권한 검증
-- 게시물 상태 관리
-  - 판매중 / 거래완료
+## Tech Stack
 
-### 게시물 정보
-- 제목, 내용, 가격
-- 카테고리
-- 지역 정보
-- 이미지 다중 첨부  
-  → 이미지 업로드 기능을 활용
+- **Language:** Python 3.11
+- **Web framework:** FastAPI 0.128 / Starlette, served by Uvicorn (uvloop, httptools)
+- **ORM / DB:** SQLAlchemy 2.0 (async) + `aiomysql` over MySQL; Alembic for migrations (`pymysql` sync driver)
+- **Auth:** Authlib (JWT HS256 + Google OAuth2 / OIDC), Argon2 password hashing
+- **Real-time:** Native WebSockets via FastAPI/Starlette
+- **Validation / config:** Pydantic v2, pydantic-settings (env-file driven)
+- **Storage:** AWS S3 via boto3
+- **Tooling:** `uv` for dependency management; Docker, GitHub Actions, nginx, certbot for delivery
 
-### 목록 조회
-- 최신순 / 가격순 정렬
-- 카테고리 필터
-- 지역 기반 필터
-- 페이지네이션 적용  
-  → **중고 거래(게시물) 페이지네이션**
+## Getting Started
 
----
+### Prerequisites
 
-## 3. 지역 선택
+- Python 3.11+ and [`uv`](https://github.com/astral-sh/uv)
+- A MySQL instance (the app uses async `aiomysql`; spatial features require MySQL with GIS support)
+- Google OAuth2 client credentials (for social login)
+- AWS credentials in the environment if exercising image upload (boto3 → S3)
 
-### 지역 설정
-- 유저 기본 지역 설정
-- 지역 변경 기능
+### Configuration
 
-### 지역 기반 노출
-- 게시물 조회 시 지역 필터 적용
-- 내 지역 중심 피드 구성
+Environment is selected by the `ENV` variable (`local` / `dev` / `test` / `prod`) and loaded from the matching `.env.<ENV>` file. Copy an example and fill it in:
 
----
+```bash
+cp .env.local.example .env.local
+# set DB_USER, DB_PASSWORD, DB_DATABASE, the token/session secrets,
+# Google OAuth credentials, and FRONTEND_URL
+```
 
-## 4. 좋아요 / 즐겨찾기
+### Install & run
 
-### 좋아요 기능
-- 게시물 좋아요 등록 / 취소
-- 중복 좋아요 방지
+```bash
+# install dependencies into a managed virtualenv
+make sync            # == uv sync
 
-### 관심 목록
-- 내가 좋아요한 게시물 목록 조회
-- 페이지네이션 적용  
-  → **프로필 페이지네이션**
+# apply database migrations
+uv run alembic upgrade head
 
----
+# start the API (defaults to ENV=local)
+uv run uvicorn carrot.main:app --reload
+```
 
-## 5. 중고 거래 + 가상 화폐 결제
+The API is then available at `http://localhost:8000`, with interactive docs at `/docs`. The root route returns a health greeting and all endpoints are served under `/api`.
 
-### 가상 화폐(포인트)
-- 사용자 지갑 관리
-- 잔액 조회
-- 포인트 충전 (테스트용)
+### Run with Docker
 
-### 거래 프로세스
-- 구매 요청 → 판매자 수락 → 결제 → 거래 완료
-- 거래 상태 관리
-  - `REQUESTED / ACCEPTED / PAID / COMPLETED / CANCELED`
+```bash
+docker build -t carrot-server .
+docker run --env-file .env.dev -e ENV=dev -p 8000:8000 carrot-server
+```
 
-### 정합성 처리
-- 잔액 부족 검증
-- 중복 결제 방지
-- 트랜잭션 처리
+The container launches `uvicorn carrot.main:app` on port `8000`. For the full reverse-proxy + TLS topology used in deployment, see `deploy/docker-compose.yml` and `deploy/nginx`.
 
-### 거래 내역 조회
-- 구매 / 판매 내역 조회
-- 페이지네이션 적용  
-  → **프로필 페이지네이션**
+### Regenerating `requirements.txt`
 
----
+The pinned `requirements.txt` (used by the Docker build) is exported from the `uv` lockfile:
 
-## 6. 채팅
-
-### 채팅 유형
-- 게시물 기반 1:1 채팅
-
-### 기능
-- 채팅방 생성
-- 메시지 전송 / 조회
-- 채팅방 목록 조회
-
-### 실시간 통신
-- WebSocket 기반 실시간 메시지 처리
-- (선택) 읽음 상태 처리
-
-### 목록 조회
-- 채팅방 목록 페이지네이션
-- 메시지 히스토리 페이지네이션  
-  → **채팅 페이지네이션**
-
----
-
-## 7. 경매 (추가 기능)
-
-### 경매 게시물
-- 경매 전용 게시물 생성
-- 시작가 / 즉시구매가 / 최소입찰단위
-- 경매 시작 / 종료 시간
-- 경매 상태 관리
-  - `SCHEDULED / LIVE / ENDED / CANCELED`
-- 이미지 첨부  
-  → 이미지 업로드 기능 활용
-
-### 경매 목록
-- 경매 게시물 목록 조회
-- 페이지네이션 적용  
-  → **경매 페이지네이션**
-
-### 그룹 채팅
-- 경매 참가자 전용 그룹 채팅방
-- 참가 버튼을 통한 입장
-- 시스템 메시지(입찰 갱신, 마감 안내 등)
-
-### 입찰 시스템
-- 입찰 금액 검증
-- 최소 입찰 단위 검증
-- 마감 이후 입찰 차단
-- 동시성 제어를 통한 최고가 보장
-
-### 낙찰 및 결제
-- 경매 종료 시 자동 낙찰 처리
-- 낙찰자 가상 화폐 결제
-- 거래 기록 생성
+```bash
+make reqs
+```
